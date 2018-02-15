@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 from collections import deque
 import logging
@@ -8,8 +8,9 @@ import serial
 import socket
 import struct
 import sys, os
-import threading, thread
+import threading
 import time, datetime
+import paho.mqtt.client as mqtt
 
 ##############################################################################
 #  pyRadMon - logger for Geiger counters                                     #
@@ -38,7 +39,7 @@ import time, datetime
 #  version is a.b.c, change in a or b means new functionality/bugfix,        #
 #  change in c = bugfix                                                      #
 #  do not uncomment line below, it's currently used in HTTP headers          #
-VERSION="1.3.0"
+VERSION="1.4.0"
 #  To see your online los, report a bug or request a new feature, please     #
 #  visit http://www.radmon.org and/or https://sourceforge.net/p/pyradmon     #
 ##############################################################################
@@ -62,6 +63,7 @@ class config():
     MYGEIGER = 2
     GMC = 3
     NETIO = 4
+    MQTT = 5
 
     def __init__(self):
         # define constants
@@ -71,6 +73,7 @@ class config():
         self.MYGEIGER = 2
         self.GMC = 3
         self.NETIO = 4
+        self.MQTT = 5
 
         self.user = "not_set"
         self.password = "not_set"
@@ -81,7 +84,7 @@ class config():
         self.protocol = self.UNKNOWN
 
     def readConfig(self):
-        print "Reading configuration:\r\n\t"
+        print ("Reading configuration:\r\n\t")
         logger.info("Reading configuration")
         # if file is present then try to read configuration from it
         try:
@@ -98,22 +101,22 @@ class config():
 
                     if parameter == "user":
                         self.user = value
-                        print "\tUser name configured\r\n\t"
+                        print ("\tUser name configured\r\n\t")
                         logger.info("User name configured")
 
                     elif parameter == "password":
                         self.password = value
-                        print "\tPassword configured\r\n\t"
+                        print ("\tPassword configured\r\n\t")
                         logger.info("Password configured")
 
                     elif parameter == "serialport":
                         self.portName = value
-                        print "\tSerial port name configured\r\n\t"
+                        print ("\tSerial port name configured\r\n\t")
                         logger.info("Serial port name configured")
 
                     elif parameter == "speed":
                         self.portSpeed = int(value)
-                        print "\tSerial port speed configured\r\n\t"
+                        print ("\tSerial port speed configured\r\n\t")
                         logger.info("Serial port speed configured")
 
                     elif parameter == "protocol":
@@ -122,26 +125,28 @@ class config():
                             self.protocol = self.MYGEIGER
                         elif value == "demo":
                             self.protocol = self.DEMO
+                        elif value == "mqtt":
+                            self.protocol = self.MQTT
                         elif value == "gmc":
                             self.protocol = self.GMC
                         elif value == "netio":
                             self.protocol=self.NETIO
 
                     if self.protocol != self.UNKNOWN:
-                        print "\tProtocol configured\r\n\t"
+                        print ("\tProtocol configured\r\n\t")
                         logger.info("Protocol configured")
                 # end of if
             # end of while
             f.close()
         except Exception as e:
-            print "\tFailed to read configuration file:\r\n\t", str(e), "\r\nExiting\r\n"
+            print ("\tFailed to read configuration file:\r\n\t", str(e), "\r\nExiting\r\n")
             logger.exception("Failed to read configuration file: " + str(e))
             # Set EOL for log
             logger.info("--------------------------------------- EOL ---------------------------------------\r\n")
             logging.shutdown()
             exit(1)
         # well done, configuration is ready to use
-        print ""
+        print ("")
 
 ################################################################################
 # Part 2 - Geiger counter communication
@@ -166,7 +171,7 @@ class baseGeigerCommunication(threading.Thread):
 
     def run(self):
         try:
-            print "Gathering data started => geiger 1\r\n"
+            print ("Gathering data started => geiger 1\r\n")
             self.serialPort = serial.Serial(self.sPortName, self.sPortSpeed, timeout = 1)
             self.serialPort.flushInput()
 
@@ -175,18 +180,18 @@ class baseGeigerCommunication(threading.Thread):
             while(self.stopwork == 0):
                 result = self.getData()
                 while(self.queueLock == 1):
-                    print "Geiger communication: queue locked! => geiger 1\r\n"
+                    print ("Geiger communication: queue locked! => geiger 1\r\n")
                     logger.warning("Geiger communication: queue locked! => geiger 1")
                     time.sleep(0.5)
                 self.queueLock = 1
                 self.queue.append(result)
                 self.queueLock = 0
-                print "Geiger sample => geiger 1:\tCPM =", result[0], "\t", str(result[1])
+                print ("Geiger sample => geiger 1:\tCPM =", result[0], "\t"), str(result[1])
 
             self.serialPort.close()
-            print "Gathering data from Geiger stopped => geiger 1\r\n"
+            print ("Gathering data from Geiger stopped => geiger 1\r\n")
         except serial.SerialException as e:
-            print "Problem with serial port => geiger 1:\r\n\t", str(e), "\r\nExiting\r\n"
+            print ("Problem with serial port => geiger 1:\r\n\t", str(e), "\r\nExiting\r\n")
             logger.exception("Problem with serial port => geiger 1: " + str(e))
             self.stop()
             # Set EOL for log
@@ -195,7 +200,7 @@ class baseGeigerCommunication(threading.Thread):
             sys.exit(1)
 
     def initCommunication(self):
-        print "Initializing geiger communication => geiger 1\r\n"
+        print ("Initializing geiger communication => geiger 1\r\n")
 
     def sendCommand(self, command):
         self.serialPort.flushInput()
@@ -224,7 +229,7 @@ class baseGeigerCommunication(threading.Thread):
 
             # check if it's safe to process queue
             while(self.queueLock == 1):
-                print "getResult: queue locked! => geiger 1\r\n"
+                print ("getResult: queue locked! => geiger 1\r\n")
                 logger.warning("getResult: queue locked! => geiger 1")
                 time.sleep(0.5)
 
@@ -254,23 +259,60 @@ class baseGeigerCommunication(threading.Thread):
 
         return data
 
+class Mqtt(baseGeigerCommunication):
+
+    def __init__(self, cfg):
+        super(baseGeigerCommunication, self).__init__()
+        params = cfg.portName.split(':')
+        self.server = params[0]
+        self.topic = params[1]
+        self.port = cfg.portSpeed
+        self.timeout = cfg.timeout
+        self.stopwork = 0
+        self.queue = deque()
+        self.queueLock = 0
+        self.is_running = 1
+        self.name = "Mqtt"
+
+    def run(self):
+        print ("Gathering data started => geiger 1\r\n")
+
+        def on_message(mqttc, obj, msg):
+            utcTime = datetime.datetime.utcnow()
+            data = [int(msg.payload), utcTime]
+            while(self.queueLock == 1):
+                time.sleep(0.5)
+            self.queueLock = 1
+            self.queue.append(data)
+            self.queueLock = 0
+
+        mqttc = mqtt.Client("pyradmon")
+        mqttc.on_message = on_message
+        mqttc.connect(self.server, self.port, 60)
+        mqttc.subscribe(self.topic, 0)
+
+        while(self.stopwork == 0):
+            mqttc.loop()
+
+        print ("Gathering data from Geiger stopped => geiger 1\r\n")
+
 class Demo(baseGeigerCommunication):
 
     def run(self):
-        print "Gathering data started => geiger 1\r\n"
+        print ("Gathering data started => geiger 1\r\n")
 
         while(self.stopwork == 0):
             result = self.getData()
             while(self.queueLock == 1):
-                print "Geiger communication: queue locked! => geiger 1\r\n"
+                print ("Geiger communication: queue locked! => geiger 1\r\n")
                 logger.warning("Geiger communication: queue locked! => geiger 1")
                 time.sleep(0.5)
             self.queueLock = 1
             self.queue.append(result)
             self.queueLock = 0
-            print "Geiger sample => geiger 1:\t", result, "\r\n"
+            print ("Geiger sample => geiger 1:\t", result, "\r\n")
 
-        print "Gathering data from Geiger stopped => geiger 1\r\n"
+        print ("Gathering data from Geiger stopped => geiger 1\r\n")
 
     def getData(self):
         for i in range(0, 5):
@@ -302,7 +344,7 @@ class myGeiger(baseGeigerCommunication):
             data = [cpm, utcTime]
             return data
         except Exception as e:
-            print "\r\nProblem in getData procedure (disconnected USB device?) => geiger 1:\r\n\t", str(e), "\r\nExiting\r\n"
+            print ("\r\nProblem in getData procedure (disconnected USB device?) => geiger 1:\r\n\t", str(e), "\r\nExiting\r\n")
             logger.exception("Problem in getData procedure (disconnected USB device?) => geiger 1: " + str(e))
             self.stop()
             # Set EOL for log
@@ -314,28 +356,28 @@ class gmc(baseGeigerCommunication):
 
     def initCommunication(self):
 
-        print "Initializing GMC protocol communication => geiger 1\r\n"
+        print ("Initializing GMC protocol communication => geiger 1\r\n")
         logger.info("Initializing GMC protocol communication => geiger 1")
         # get firmware version
         response = self.sendCommand("<GETVER>>")
 
         if len(response) > 0:
-            print "Found GMC-compatible device, version => geiger 1: ", response, "\r\n"
+            print ("Found GMC-compatible device, version => geiger 1: ", response, "\r\n")
             # get serial number
             # serialnum=self.sendCommand("<GETSERIAL>>")
             # serialnum.int=struct.unpack('!1H', serialnum(7))[0]
-            # print "Device Serial Number is: ", serialnum.int
+            # print ("Device Serial Number is: "), serialnum.int
             # disable heartbeat, we will request data from script
             self.sendCommand("<HEARTBEAT0>>")
-            print "Please note data will be acquired once per 5 seconds => geiger 1\r\n"
+            print ("Please note data will be acquired once per 5 seconds => geiger 1\r\n")
             # update the device time
             unitTime = self.sendCommand("<GETDATETIME>>")
-            print "Unit shows time as => geiger 1: ", unitTime, "\r\n"
+            print ("Unit shows time as => geiger 1: ", unitTime, "\r\n")
             # self.sendCommand("<SETDATETIME[" + time.strftime("%y%m%d%H%M%S") + "]>>")
-            print "<SETDATETIME[" + time.strftime("%y%m%d%H%M%S") + "]>>"
+            print ("<SETDATETIME[" + time.strftime("%y%m%d%H%M%S") + "]>>")
 
         else:
-            print "No response from device => geiger 1\r\n"
+            print ("No response from device => geiger 1\r\n")
             logger.error("No response from device => geiger 1")
             self.stop()
             # Set EOL for log
@@ -357,7 +399,7 @@ class gmc(baseGeigerCommunication):
                 # convert bytes to 16 bit int
                 cpm = ord(response[0]) * 256 + ord(response[1])
             else:
-                print "Unknown response to CPM request, device is not GMC-compatible? => geiger 1\r\n"
+                print ("Unknown response to CPM request, device is not GMC-compatible? => geiger 1\r\n")
                 logger.error("Unknown response to CPM request, device is not GMC-compatible? => geiger 1")
                 self.stop()
                 logger.shutdown()
@@ -368,7 +410,7 @@ class gmc(baseGeigerCommunication):
             return data
 
         except Exception as e:
-            print "\r\nProblem in getData procedure (disconnected USB device?) => geiger 1:\r\n\t", str(e), "\r\nExiting\r\n"
+            print ("\r\nProblem in getData procedure (disconnected USB device?) => geiger 1:\r\n\t", str(e), "\r\nExiting\r\n")
             logger.exception("Problem in getData procedure (disconnected USB device?) => geiger 1: " + str(e))
             self.stop()
             # Set EOL for log
@@ -411,7 +453,7 @@ class netio(baseGeigerCommunication):
             return data
 
         except Exception as e:
-            print "\r\nProblem in getData procedure (disconnected USB device?) => geiger 1:\r\n\t", str(e), "\r\nExiting\r\n"
+            print ("\r\nProblem in getData procedure (disconnected USB device?) => geiger 1:\r\n\t", str(e), "\r\nExiting\r\n")
             logger.exception("Problem in getData procedure (disconnected USB device?) => geiger 1: " + str(e))
             self.stop()
             # Set EOL for log
@@ -420,11 +462,11 @@ class netio(baseGeigerCommunication):
             sys.exit(1)
 
     def initCommunication(self):
-        print "Initializing NetIO => geiger 1\r\n"
+        print ("Initializing NetIO => geiger 1\r\n")
         logger.info("Initializing NetIO => geiger 1")
         # send "go" to start receiving CPM data
         response = self.sendCommand("go\r\n")
-        print "Please note data will be acquired once per 30 seconds => geiger 1\r\n"
+        print ("Please note data will be acquired once per 30 seconds => geiger 1\r\n")
 
 ################################################################################
 # Part 3 - Web server communication
@@ -447,20 +489,20 @@ class webCommunication():
         # format date and time as required
         dtime = sampleTime.strftime("%Y-%m-%d%%20%H:%M:%S")
 
-        print "Connecting to server => geiger 1\r\n"
+        print ("Connecting to server => geiger 1\r\n")
         logger.info("Connecting to server => geiger 1")
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         url = "GET /radmon.php?user=" + self.user + "&password=" + self.password + "&function=submit&datetime=" + dtime + "&value=" + str(sampleCPM) + "&unit=CPM HTTP/1.1"
         request = url + "\r\nHost: www.radmon.org\r\nUser-Agent: pyRadMon " + VERSION + "\r\n\r\n"
-        print "Sending average sample => geiger 1: " + str(sampleCPM) + " CPM\r\n"
-        #print "\r\n### HTTP Request ###\r\n"+request
+        print ("Sending average sample => geiger 1: " + str(sampleCPM) + " CPM\r\n")
+        print ("\r\n### HTTP Request ###\r\n"+request)
 
         try:
             s.connect((self.HOST, self.PORT))
             s.settimeout(10.0) # 10 seconds to timeout, this will prevent crash
             data = None
             doneSend = False
-            s.send(request)
+            s.send(request.encode('utf8'))
             time.sleep(0.5)
             data = s.recv(1024)
             time.sleep(0.5)
@@ -468,20 +510,20 @@ class webCommunication():
                 if doneSend is False:
                     if data is not None:
                         httpResponse = str(data).splitlines()[0]
-                        print "Server response => geiger 1: ", httpResponse, "\r\n"
+                        print ("Server response => geiger 1: ", httpResponse, "\r\n")
                         logger.info("Server response => geiger 1: " + httpResponse)
                         if "incorrect login" in data.lower():
-                            print "You are using incorrect user/password combination => geiger 1!\r\n"
+                            print ("You are using incorrect user/password combination => geiger 1!\r\n")
                             logger.error("You are using incorrect user/password combination => geiger 1!")
                             geigerCommunication.stop()
                             logging.shutdown()
                             sys.exit(1)
                         doneSend = True
         except Exception as ex:
-            print "Could not communicate with the Server, timeout reached. => geiger 1: ", ex, "\r\n"
+            print ("Could not communicate with the Server, timeout reached. => geiger 1: ", ex, "\r\n")
             logger.exception("Could not communicate with the Server, timeout reached. => geiger 1: " + str(ex))
         finally:
-            #print "\r\n### HTTP Response ###\r\n"+data+"\r\n"
+            #print ("\r\n### HTTP Response ###\r\n"+data+"\r\n")
             s.close()
 
 ################################################################################
@@ -491,7 +533,7 @@ def main():
     # main loop is in while loop
     # check if file exists, if not, create one and exit
     if (os.path.isfile("config.txt") == 0):
-        print "\tNo configuration file, creating default one.\r\n\t"
+        print ("\tNo configuration file, creating default one.\r\n\t")
 
         try:
             f = open("config.txt", 'w')
@@ -505,9 +547,9 @@ def main():
             f.write("# Protocols: demo, mygeiger, gmc, netio, audio\r\n")
             f.write("protocol=demo\r\n")
             f.write("# In case of audio, input the device number here, default is 0.\r\n")
-            print "\tPlease open config.txt file using text editor and update configuration.\r\n"
+            print ("\tPlease open config.txt file using text editor and update configuration.\r\n")
         except Exception as e:
-            print "\tFailed to create configuration file\r\n\t", str(e)
+            print ("\tFailed to create configuration file\r\n\t"), str(e)
             logger.exception("Failed to create configuration file" + str(e))
         finally:
             time.sleep(1)
@@ -522,21 +564,24 @@ def main():
         cfg.readConfig()
         # create geiger communication object
         if cfg.protocol == config.MYGEIGER:
-            print "Using myGeiger protocol => geiger 1\r\n"
+            print ("Using myGeiger protocol => geiger 1\r\n")
             logger.info("Using myGeiger protocol => geiger 1")
             geigerCommunication = myGeiger(cfg)
         elif cfg.protocol == config.DEMO:
-            print "Using Demo mode => geiger 1\r\n"
+            print ("Using Demo mode => geiger 1\r\n")
             logger.info("Using DEMO protocol => geiger 1")
             geigerCommunication = Demo(cfg)
         elif cfg.protocol == config.GMC:
-            print "Using GMC protocol => geiger 1\r\n"
+            print ("Using GMC protocol => geiger 1\r\n")
             geigerCommunication = gmc(cfg)
         elif cfg.protocol == config.NETIO:
-            print "Using NetIO protocol => geiger 1\r\n"
+            print ("Using NetIO protocol => geiger 1\r\n")
             geigerCommunication = netio(cfg)
+        elif cfg.protocol == config.MQTT:
+            print ("Using MQTT protocol => geiger 1\r\n")
+            geigerCommunication = Mqtt(cfg)
         else:
-            print "Unknown protocol configured, can't run => geiger 1\r\n"
+            print ("Unknown protocol configured, can't run => geiger 1\r\n")
             logger.error("Unknown protocol configured, can't run => geiger 1")
             # Set EOL for log
             logger.info("--------------------------------------- EOL ---------------------------------------\r\n")
@@ -556,47 +601,47 @@ def main():
 
                 if sample[0] != -1:
                     # sample is valid, CPM !=-1
-                    print "Average result => geiger 1:\tCPM =", sample[0], "\t", str(sample[1]), "\r\n"
+                    print ("Average result => geiger 1:\tCPM =", sample[0], "\t", str(sample[1]), "\r\n")
                     try:
                         webService.sendSample(sample)
                     except Exception as e:
-                        print "Error communicating server => geiger 1:\r\n\t", str(e), "\r\n"
+                        print ("Error communicating server => geiger 1:\r\n\t", str(e), "\r\n")
                         logger.exception("Error communicating server => geiger 1: " + str(e))
 
-                    print "Waiting 30 seconds => geiger 1\r\n"
+                    print ("Waiting 30 seconds => geiger 1\r\n")
                     # Waiting 60x0.5 seconds,
                     # it has a better response when CTRL+C is used,
                     # might be changed in future
                     for i in range(0, 60):
                         time.sleep(0.5)
                 else:
-                    print "No samples in queue, waiting 5 seconds => geiger 1\r\n"
+                    print ("No samples in queue, waiting 5 seconds => geiger 1\r\n")
                     for i in range(0, 5):
                         time.sleep(1)
                     continue
 
         except KeyboardInterrupt as e:
-            print "\r\nCTRL+C pressed, exiting program\r\n\t", str(e), "\r\n"
+            print ("\r\nCTRL+C pressed, exiting program\r\n\t", str(e), "\r\n")
             logger.exception("CTRL+C pressed, exiting program: " + str(e))
 
         except SystemExit:
-            print "\r\nSystem exit\r\n\t", str(e), "\r\n"
+            print ("\r\nSystem exit\r\n\t", str(e), "\r\n")
             logger.exception("System exit: " + str(e))
 
         except Exception as e:
-            print "\r\nUnhandled error\r\n\t", str(e), "\r\n"
+            print ("\r\nUnhandled error\r\n\t", str(e), "\r\n")
             logger.exception("Unhandled error: " + str(e))
 
         geigerCommunication.stop()
 
         # Threading fix
-        print "Waiting and reap threads"
+        print ("Waiting and reap threads")
         logger.warning("Waiting and reap threads")
         time.sleep(1)
         for numThread in threading.enumerate():
             if numThread.isDaemon(): continue
             if numThread.getName() == 'MainThread': continue
-            print "Stopping alive thread: ", numThread.getName(), "\r\n\t"
+            print ("Stopping alive thread: ", numThread.getName(), "\r\n\t")
             logger.info("Stopping alive thread: " + numThread.getName())
             numThread.stop()
             time.sleep(1)
